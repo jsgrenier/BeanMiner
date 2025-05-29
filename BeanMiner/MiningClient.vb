@@ -119,14 +119,6 @@ Public Class MiningClient
             _stopClient = True
         End Try
     End Sub
-
-    ' --- PrimaryServerMessageReaderLoop, IsWorkPackage, HandleServerNotificationOrStatus ---
-    ' --- MiningWorkerLoop, CalculateAndDisplayHashRateLoop, FormatHashRate        ---
-    ' (These methods remain the same as the last correct version you had where it started working)
-    ' For brevity, I'm not repeating them here, but ensure they are the versions from
-    ' the "single network reader thread" refactor. I'll paste the UpdateConsoleDisplay below.
-
-
     Private Sub PrimaryServerMessageReaderLoop()
         If _client Is Nothing OrElse Not _client.Connected Then Return
 
@@ -155,8 +147,8 @@ Public Class MiningClient
 
                 If IsWorkPackage(serverMessage) Then
                     UpdateConsoleDisplay("Received new work package from server.", ConsoleColor.Magenta)
-                    _currentMiningJobCts?.Cancel()
-                    _workPackageQueue.Add(serverMessage)
+                    _currentMiningJobCts?.Cancel() ' Cancel previous job
+                    _workPackageQueue.Add(serverMessage) ' Add new job
                 Else
                     HandleServerNotificationOrStatus(serverMessage, serverMessageJson)
                 End If
@@ -166,13 +158,13 @@ Public Class MiningClient
         Catch exSocket As SocketException
             If Not _stopClient Then UpdateConsoleDisplay($"Reader Socket Error (server disconnected?): {exSocket.Message}", ConsoleColor.Red)
         Catch exThread As ThreadInterruptedException
-            UpdateConsoleDisplay("Primary message reader thread interrupted.", ConsoleColor.Yellow)
+            UpdateConsoleDisplay("Primary message reader thread interrupted.", ConsoleColor.Yellow) ' Expected on Kill
         Catch ex As Exception
-            If Not _stopClient Then UpdateConsoleDisplay($"Critical error in primary message reader: {ex.Message}", ConsoleColor.Red)
+            If Not _stopClient Then UpdateConsoleDisplay($"Critical error in primary message reader: {ex.ToString()}", ConsoleColor.Red)
         Finally
-            _stopClient = True
-            _currentMiningJobCts?.Cancel()
-            _workPackageQueue.CompleteAdding()
+            _stopClient = True ' Ensure client stops if reader fails
+            _currentMiningJobCts?.Cancel() ' Cancel any ongoing mining
+            _workPackageQueue.CompleteAdding() ' Signal no more work will be added
             UpdateConsoleDisplay("Primary message reader stopped.", ConsoleColor.Gray, False, True)
         End Try
     End Sub
@@ -190,12 +182,13 @@ Public Class MiningClient
 
         If msgType = "newBlock" Then
             UpdateConsoleDisplay($"Server: New block {serverMessage("index")} (Hash: {serverMessage("hash").ToString().Substring(0, 8)}...) by {serverMessage("minerAddress")?.ToString().Substring(0, 10)}...", ConsoleColor.DarkMagenta)
-            _currentMiningJobCts?.Cancel()
+            _currentMiningJobCts?.Cancel() ' New block from another miner, current work is stale
         ElseIf status IsNot Nothing Then
             If status.Equals("success", StringComparison.OrdinalIgnoreCase) Then
                 UpdateConsoleDisplay($"Server ACK: {message} (BlockHash: {serverMessage("blockHash")?.ToString().Substring(0, 8)}...)", ConsoleColor.Green, True)
             ElseIf status.Equals("error", StringComparison.OrdinalIgnoreCase) Then
                 UpdateConsoleDisplay($"Server NACK: {message}", ConsoleColor.Red, True)
+                ' If server rejected our block (stale or invalid), we should also consider current work stale
                 If message?.Contains("Stale block", StringComparison.OrdinalIgnoreCase) = True OrElse
                    message?.Contains("Invalid block", StringComparison.OrdinalIgnoreCase) = True Then
                     _currentMiningJobCts?.Cancel()
@@ -210,22 +203,26 @@ Public Class MiningClient
     Private Sub MiningWorkerLoop()
         Try
             While Not _stopClient
-                _currentMiningJobCts?.Dispose() ' Dispose the previous job's CTS
+                _currentMiningJobCts?.Dispose() ' Dispose the previous job's CTS if it exists
                 _currentMiningJobCts = New CancellationTokenSource() ' Create a new one for this job
                 Dim currentJobToken As CancellationToken = _currentMiningJobCts.Token
 
                 Dim workPackage As JObject = Nothing
                 Try
+                    ' Wait indefinitely for work, but respect cancellation token
                     workPackage = _workPackageQueue.Take(currentJobToken)
                 Catch Ex As OperationCanceledException
-                    UpdateConsoleDisplay("Mining worker cancelled while waiting for work.", ConsoleColor.Yellow)
-                    If _stopClient Then Exit While Else Continue While
+                    ' This is expected if a new work package arrives or client is stopping
+                    UpdateConsoleDisplay("Mining worker cancelled while waiting for work.", ConsoleColor.DarkYellow)
+                    If _stopClient Then Exit While Else Continue While ' If client stopping, exit. Else, get new work.
                 Catch ex As InvalidOperationException
-                    If _stopClient Then Exit While Else Continue While
+                    ' This happens if _workPackageQueue is marked as complete and Take is called.
+                    UpdateConsoleDisplay("Work package queue completed. Mining worker exiting.", ConsoleColor.DarkYellow)
+                    Exit While ' Exit loop as no more work will come.
                 End Try
 
-                If _stopClient OrElse workPackage Is Nothing Then Exit While
-                If currentJobToken.IsCancellationRequested Then Continue While
+                If _stopClient OrElse workPackage Is Nothing Then Exit While ' Should be caught by InvalidOp or OpCanceled
+                If currentJobToken.IsCancellationRequested Then Continue While ' New work arrived while processing Take
 
                 Dim lastIndex As Integer = workPackage("lastIndex").ToObject(Of Integer)()
                 Dim lastHash As String = workPackage("lastHash").ToString()
@@ -239,65 +236,91 @@ Public Class MiningClient
 
                 If rewardAmount <= 0 AndAlso mempoolTransactions.Count = 0 Then
                     UpdateConsoleDisplay("No reward and no transactions. Waiting for new work...", ConsoleColor.DarkYellow)
-                    Continue While
+                    Continue While ' Effectively skips mining this "empty" work
                 End If
 
-                Dim blockTransactions As New List(Of JObject)(mempoolTransactions)
-                Dim blockTimestamp = DateTime.UtcNow
+                Dim blockTransactions As New List(Of JObject)(mempoolTransactions) ' Start with mempool txs
+
+                ' *** IMPORTANT: Use a DateTime object for the block, but format it precisely for the coinbase tx string ***
+                Dim blockDateTimeObject = DateTime.UtcNow
+                ' Format to 7 places, then effectively "truncate" like the server seems to be doing
+                Dim fullPreciseTimestampString = blockDateTimeObject.ToUniversalTime().ToString(Block.PreciseTimestampFormat, CultureInfo.InvariantCulture)
+                Dim serverLikeTimestampString As String
+                If fullPreciseTimestampString.EndsWith("0Z") AndAlso fullPreciseTimestampString.Length > 3 AndAlso Char.IsDigit(fullPreciseTimestampString(fullPreciseTimestampString.Length - 3)) Then
+                    ' Attempt to mimic server's truncation if it's a trailing zero before Z
+                    Dim tempDt = DateTime.ParseExact(fullPreciseTimestampString, Block.PreciseTimestampFormat, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)
+                    serverLikeTimestampString = tempDt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.FFFFFFZ", CultureInfo.InvariantCulture) ' Format with 6 F's
+                Else
+                    serverLikeTimestampString = fullPreciseTimestampString ' No trailing zero to worry about or not standard
+                End If
+
 
                 If rewardAmount > 0 Then
-                    Dim coinbaseTxData = New JObject From {
-                        {"timestamp", blockTimestamp.ToString("o", CultureInfo.InvariantCulture)},
-                        {"type", "transfer"}, {"from", "miningReward"}, {"to", minerAddressForReward},
-                        {"amount", rewardAmount}, {"token", "BEAN"}, {"txId", Guid.NewGuid().ToString("N")}
-                    }
-                    blockTransactions.Add(New JObject From {{"transaction", coinbaseTxData}})
+                    Dim coinbaseTxData = New JObject()
+                    coinbaseTxData.Add("timestamp", New JValue(serverLikeTimestampString)) ' Explicitly JValue(Of String)
+                    coinbaseTxData.Add("type", New JValue("transfer"))
+                    coinbaseTxData.Add("from", New JValue("miningReward"))
+                    coinbaseTxData.Add("to", New JValue(minerAddressForReward))
+                    coinbaseTxData.Add("amount", New JValue(rewardAmount)) ' JValue(Of Decimal)
+                    coinbaseTxData.Add("token", New JValue("BEAN"))
+                    coinbaseTxData.Add("txId", New JValue(Guid.NewGuid().ToString("N")))
+
+                    blockTransactions.Add(New JObject From {{"transaction", coinbaseTxData}}) ' Wrapper JObject
                 End If
 
-                ' Create block with the specific difficulty for this job
-                Dim newBlockCandidate As New Block(lastIndex + 1, blockTimestamp, blockTransactions, lastHash, _currentJobDifficulty)
+                ' Create block with the specific difficulty for this job and the captured DateTime object
+                Dim newBlockCandidate As New Block(lastIndex + 1, blockDateTimeObject, blockTransactions, lastHash, _currentJobDifficulty)
                 Dim blockFound As Boolean = False
-                Dim winningNonce As Integer = -1
+                Dim winningNonce As Integer = -1 ' Stores the nonce if found by any thread
                 Dim winningHash As String = ""
 
-                Interlocked.Exchange(_hashCount, 0)
+                Interlocked.Exchange(_hashCount, 0) ' Reset hash counter for this job
 
-                Dim parallelOptions As New ParallelOptions() With {.CancellationToken = currentJobToken}
+                ' Use one less than processor count, or at least 1 thread if only 1 processor.
+                Dim numThreadsToUse = Math.Max(1, Environment.ProcessorCount - 1)
+                If Environment.ProcessorCount = 1 Then numThreadsToUse = 1
+
+                Dim parallelOptions As New ParallelOptions() With {
+                    .CancellationToken = currentJobToken,
+                    .MaxDegreeOfParallelism = numThreadsToUse
+                }
 
                 Try
-                    Parallel.For(0, Math.Max(1, Environment.ProcessorCount - 1), parallelOptions,
+                    Parallel.For(0, numThreadsToUse, parallelOptions,
                         Sub(coreIndex, loopState)
+                            ' Check for cancellation at the beginning of each thread's work
                             If currentJobToken.IsCancellationRequested OrElse _stopClient OrElse blockFound Then
                                 loopState.Stop()
                                 Return
                             End If
 
-                            Dim localNonceStart = coreIndex
-                            Dim currentNonce = localNonceStart
-                            ' Each thread uses the job's difficulty stored in the newBlockCandidate instance
+                            ' Each thread gets its own copy of the block to work on its nonce range
+                            ' It's crucial this uses the same DateTime object and Data list reference initially
+                            ' but it will modify its own Nonce and Hash.
                             Dim threadBlock As New Block(newBlockCandidate.Index, newBlockCandidate.Timestamp,
                                                         newBlockCandidate.Data, newBlockCandidate.PreviousHash,
-                                                        newBlockCandidate.Difficulty) ' Pass difficulty
+                                                        newBlockCandidate.Difficulty)
 
-                            While Not currentJobToken.IsCancellationRequested AndAlso Not _stopClient AndAlso Not blockFound AndAlso currentNonce < Integer.MaxValue - Environment.ProcessorCount
+                            Dim currentNonce = coreIndex ' Start nonce based on thread index
+
+                            While Not currentJobToken.IsCancellationRequested AndAlso Not _stopClient AndAlso Not blockFound AndAlso currentNonce < Integer.MaxValue - numThreadsToUse
                                 threadBlock.Nonce = currentNonce
-                                threadBlock.Hash = threadBlock.CalculateHash() ' CalculateHash itself does not use difficulty
-                                Interlocked.Increment(CType(Me, MiningClient)._hashCount)
+                                threadBlock.Hash = threadBlock.CalculateHash() ' This uses the block's own properties
+                                Interlocked.Increment(CType(Me, MiningClient)._hashCount) ' Thread-safe increment
 
-                                ' Check PoW against the block's own stored difficulty
                                 If threadBlock.Hash.StartsWith(New String("0"c, threadBlock.Difficulty)) Then
+                                    ' Attempt to set winningNonce only if it hasn't been set yet (-1)
                                     If Interlocked.CompareExchange(winningNonce, currentNonce, -1) = -1 Then
+                                        ' This thread is the first to find a solution
                                         winningHash = threadBlock.Hash
-                                        blockFound = True
-                                        newBlockCandidate.Nonce = winningNonce
-                                        newBlockCandidate.Hash = winningHash
-                                        newBlockCandidate.BlockSize = newBlockCandidate.CalculateBlockSize()
+                                        blockFound = True ' Signal other threads to stop (though CancellationToken is primary)
+                                        ' The main newBlockCandidate will be updated outside the loop if blockFound is true
                                     End If
-                                    loopState.Stop()
-                                    Exit While
+                                    loopState.Stop() ' Signal Parallel.For to stop other iterations
+                                    Exit While ' Exit this thread's loop
                                 End If
-                                currentNonce += Math.Max(1, Environment.ProcessorCount - 1)
-                                If currentNonce < 0 Then currentNonce = coreIndex
+                                currentNonce += numThreadsToUse ' Increment by number of threads for interleaved nonces
+                                If currentNonce < 0 Then currentNonce = coreIndex ' Handle potential overflow (very unlikely)
                             End While
                         End Sub)
                 Catch exOpCancel As OperationCanceledException
@@ -305,32 +328,52 @@ Public Class MiningClient
                 End Try
 
                 If blockFound AndAlso Not _stopClient AndAlso Not currentJobToken.IsCancellationRequested Then
+                    ' Update the original newBlockCandidate with the winning nonce and hash
+                    newBlockCandidate.Nonce = winningNonce
+                    newBlockCandidate.Hash = winningHash ' This should match if CalculateHash is deterministic
+                    newBlockCandidate.BlockSize = newBlockCandidate.CalculateBlockSize() ' Finalize BlockSize
+
                     UpdateConsoleDisplay($"MINED BLOCK! Nonce: {winningNonce}, Hash: {winningHash} (Diff: {newBlockCandidate.Difficulty})", ConsoleColor.Green, True)
+
+                    ' --- Start Debug Logging for Hash Mismatch ---
+                    ' Recalculate hash on the final candidate to populate Block.LastCalculatedDataToHash
+                    Dim finalClientHashCheck = newBlockCandidate.CalculateHash()
+                    Dim clientDataToHash = Block.LastCalculatedDataToHash
+
+                    If finalClientHashCheck <> winningHash Then
+                        UpdateConsoleDisplay($"CRITICAL CLIENT HASH MISMATCH! Winning: {winningHash}, Recalc: {finalClientHashCheck}", ConsoleColor.DarkMagenta, True)
+                    End If
+
+
                     Dim blockJsonString = JsonConvert.SerializeObject(newBlockCandidate, Formatting.None)
                     Dim blockJObject = JObject.Parse(blockJsonString)
                     Dim submission As New JObject()
                     submission.Add("block", blockJObject)
                     SyncLock _writerLock
-                        If Not _stopClient AndAlso _serverStreamWriter IsNot Nothing Then
-                            _serverStreamWriter.WriteLine(submission.ToString(Formatting.None))
+                        If Not _stopClient AndAlso _serverStreamWriter IsNot Nothing AndAlso _client.Connected Then
+                            Try
+                                _serverStreamWriter.WriteLine(submission.ToString(Formatting.None))
+                            Catch ex As Exception
+                                UpdateConsoleDisplay($"Error sending mined block: {ex.Message}", ConsoleColor.Red)
+                                _stopClient = True ' Stop if we can't send to server
+                            End Try
                         End If
                     End SyncLock
-                    UpdateConsoleDisplay("Sent mined block to server.", ConsoleColor.Cyan)
+                    If Not _stopClient Then UpdateConsoleDisplay("Sent mined block to server.", ConsoleColor.Cyan)
                 ElseIf Not _stopClient Then
-
                     If currentJobToken.IsCancellationRequested Then
                         UpdateConsoleDisplay("Current mining job stopped due to new work/block or client shutdown.", ConsoleColor.Yellow)
                     Else
-                        UpdateConsoleDisplay($"Mining attempt finished for diff {_currentJobDifficulty}, no block found.", ConsoleColor.DarkYellow)
+                        UpdateConsoleDisplay($"Mining attempt finished for diff {_currentJobDifficulty}, no block found in parallel search.", ConsoleColor.DarkYellow)
                     End If
                 End If
             End While
         Catch exOuterLoop As Exception
-            If Not _stopClient Then UpdateConsoleDisplay($"Critical error in mining worker main loop: {exOuterLoop.Message}{vbCrLf}{exOuterLoop.StackTrace}", ConsoleColor.Red)
+            If Not _stopClient Then UpdateConsoleDisplay($"Critical error in mining worker main loop: {exOuterLoop.ToString()}", ConsoleColor.Red)
         Finally
-            _currentMiningJobCts?.Cancel()
+            _currentMiningJobCts?.Cancel() ' Ensure cancellation
             _currentMiningJobCts?.Dispose()
-            _stopClient = True
+            _stopClient = True ' Signal other loops to stop
             UpdateConsoleDisplay("Mining worker loop stopped.", ConsoleColor.Gray, False, True)
         End Try
     End Sub
@@ -338,23 +381,23 @@ Public Class MiningClient
     Private Sub CalculateAndDisplayHashRateLoop()
         Try
             While Not _stopClient
-                Thread.Sleep(1000)
+                Thread.Sleep(1000) ' Update every second
                 If _stopClient Then Exit While
 
-                Dim currentHashes = Interlocked.Read(_hashCount)
+                Dim currentHashes = Interlocked.Read(_hashCount) ' Read the volatile hashCount
                 Dim timeDiff = (DateTime.UtcNow - _lastHashRateUpdateTime).TotalSeconds
 
-                If timeDiff >= 0.95 Then
+                If timeDiff >= 0.95 Then ' Check roughly every second, allow for small timing variations
                     _currentHashRate = If(timeDiff > 0, (currentHashes - _lastHashCountForRate) / timeDiff, 0)
-                    _lastHashCountForRate = currentHashes
+                    _lastHashCountForRate = currentHashes ' Update for next calculation
                     _lastHashRateUpdateTime = DateTime.UtcNow
-                    UpdateConsoleDisplay("", ConsoleColor.White, False, True, True)
+                    UpdateConsoleDisplay("", ConsoleColor.White, False, True, True) ' Force redraw with latest hash rate
                 End If
             End While
         Catch exThread As ThreadInterruptedException
             UpdateConsoleDisplay("Hash rate display thread interrupted.", ConsoleColor.Yellow, False, True, True)
         Catch ex As Exception
-            If Not _stopClient Then UpdateConsoleDisplay($"Error in hash rate display: {ex.Message}", ConsoleColor.DarkRed, False, True, True)
+            If Not _stopClient Then UpdateConsoleDisplay($"Error in hash rate display: {ex.ToString()}", ConsoleColor.DarkRed, False, True, True)
         Finally
             UpdateConsoleDisplay("Hash rate display stopped.", ConsoleColor.Gray, False, True, True)
         End Try
@@ -372,8 +415,6 @@ Public Class MiningClient
             Return $"{hashRate / 1000000000:F2} GH/s"
         End If
     End Function
-
-    ' RESTORED UpdateConsoleDisplay
     Private Sub UpdateConsoleDisplay(message As String, color As ConsoleColor, Optional important As Boolean = False, Optional noClear As Boolean = False, Optional isHashRateUpdateOnly As Boolean = False)
         SyncLock _consoleLock
             ' --- EXTREMELY SIMPLIFIED FOR ARM64 DEBUGGING / STABILITY ---
@@ -391,28 +432,46 @@ Public Class MiningClient
         End SyncLock
     End Sub
 
-    Public Sub Kill() ' Ensure this is present and correct
-        _stopClient = True
-        _currentMiningJobCts?.Cancel()
+    Public Sub Kill()
+        _stopClient = True ' Signal all loops to stop
+        _currentMiningJobCts?.Cancel() ' Cancel any active mining job or wait on Take
         UpdateConsoleDisplay("Disconnecting...", ConsoleColor.Yellow, True)
 
         Try
-            _workPackageQueue.CompleteAdding()
+            _workPackageQueue?.CompleteAdding() ' Signal no more items will be added, allows Take to exit
         Catch
+            ' Ignore exceptions if already completed or disposed
         End Try
 
+        ' Attempt to interrupt threads if they are sleeping or waiting
         _primaryReaderThread?.Interrupt()
-        _miningWorkerThread?.Interrupt()
+        _miningWorkerThread?.Interrupt() ' Though CancellationToken is preferred
         _hashRateDisplayThread?.Interrupt()
 
-        _primaryReaderThread?.Join(TimeSpan.FromSeconds(2))
-        _miningWorkerThread?.Join(TimeSpan.FromSeconds(3))
-        _hashRateDisplayThread?.Join(TimeSpan.FromSeconds(1))
+        ' Join threads to wait for them to finish
+        If _primaryReaderThread IsNot Nothing AndAlso _primaryReaderThread.IsAlive Then
+            _primaryReaderThread.Join(TimeSpan.FromSeconds(2))
+        End If
+        If _miningWorkerThread IsNot Nothing AndAlso _miningWorkerThread.IsAlive Then
+            _miningWorkerThread.Join(TimeSpan.FromSeconds(3)) ' Give mining a bit longer to unwind
+        End If
+        If _hashRateDisplayThread IsNot Nothing AndAlso _hashRateDisplayThread.IsAlive Then
+            _hashRateDisplayThread.Join(TimeSpan.FromSeconds(1))
+        End If
 
+        ' Clean up resources
         Try
             _currentMiningJobCts?.Dispose()
+        Catch
+        End Try
+        Try
+            _serverStreamWriter?.Close() ' Close first to flush
             _serverStreamWriter?.Dispose()
-            _client?.Close()
+        Catch
+        End Try
+        Try
+            _client?.Close() ' This closes the underlying stream too
+            _client?.Dispose()
         Catch ex As Exception
             UpdateConsoleDisplay($"Error closing client resources: {ex.Message}", ConsoleColor.DarkYellow, False, True)
         End Try
