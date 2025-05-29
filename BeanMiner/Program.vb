@@ -5,7 +5,7 @@ Module Program
 
     Sub Main()
         Console.Title = "VB.NET Mining Client"
-        Dim minerPubKey As String = "AilsDcSptGDP7EfXGV7aSqWP3aJQtF0oLMe+ziMztg0A" ' IMPORTANT: Replace this!
+        Dim minerPubKey As String = "A8hAL91ITIcesa3ODYhLqaJRDTU4/ybsAHloyYr85ybW" ' IMPORTANT: Replace this!
 
         If minerPubKey = "YOUR_PUBLIC_KEY_HERE_BASE64_ENCODED" Then
             Console.ForegroundColor = ConsoleColor.Red
@@ -23,8 +23,8 @@ Module Program
         Console.WriteLine("Starting Mining Client...")
         Try
             '                                Server IP, Port, Your Miner Public Key
-            'miningClient = New MiningClient("localhost", 8081, minerPubKey)
             miningClient = New MiningClient("192.168.18.12", 8081, minerPubKey)
+            'miningClient = New MiningClient("192.168.18.12", 8081, minerPubKey)
             miningClient.Start()
 
             Console.WriteLine("Mining client started. Press Enter to stop.")
