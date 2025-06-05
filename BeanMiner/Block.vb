@@ -11,7 +11,7 @@ Public Class Block
     Public Property Data As List(Of JObject)
     Public Property PreviousHash As String
     Public Property Hash As String
-    Public Property Nonce As Integer
+    Public Property Nonce As Long
     Public Property Difficulty As Integer
     Public Property BlockSize As Integer
 
@@ -19,6 +19,7 @@ Public Class Block
     Public Shared LastCalculatedDataToHash As String = ""
 
     Public Const PreciseTimestampFormat As String = "yyyy-MM-ddTHH:mm:ss.fffffffZ"
+    Public Const MAX_NONCE_VALUE_UINT32_EQUIVALENT As Long = 4294967295L
 
     Public Sub New(index As Integer, timestamp As DateTime, data As List(Of JObject), previousHash As String, difficulty As Integer)
         Me.Index = index
@@ -32,7 +33,7 @@ Public Class Block
     End Sub
 
     <JsonConstructor>
-    Public Sub New(index As Integer, timestamp As DateTime, data As List(Of JObject), previousHash As String, hash As String, nonce As Integer, difficulty As Integer, blockSize As Integer)
+    Public Sub New(index As Integer, timestamp As DateTime, data As List(Of JObject), previousHash As String, hash As String, nonce As Long, difficulty As Integer, blockSize As Integer)
         Me.Index = index
         Me.Timestamp = timestamp
         Me.Data = data

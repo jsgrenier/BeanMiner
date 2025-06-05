@@ -23,8 +23,8 @@ Module Program
         Console.WriteLine("Starting Mining Client...")
         Try
             '                                Server IP, Port, Your Miner Public Key
-            miningClient = New MiningClient("192.168.18.12", 8081, minerPubKey)
-            'miningClient = New MiningClient("192.168.18.12", 8081, minerPubKey)
+            miningClient = New MiningClient("localhost", 8081, minerPubKey)
+            'miningClient = New MiningClient("192.168.18.9", 8081, minerPubKey)
             miningClient.Start()
 
             Console.WriteLine("Mining client started. Press Enter to stop.")
